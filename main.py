@@ -15,27 +15,22 @@ load_dotenv()
 app = FastAPI()
 
 # ---------------- CONFIG ----------------
-# 1. Get Environment Variables
 TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 DEEPGRAM_KEY = os.getenv("DEEPGRAM_API_KEY")
 CARTESIA_KEY = os.getenv("CARTESIA_API_KEY")
-BASE_URL = os.getenv("BASE_URL")  # Crucial for Render
+BASE_URL = os.getenv("BASE_URL")
 
-# 2. Check for missing keys (Helps debug 500 errors)
 if not all([TWILIO_SID, TWILIO_TOKEN, TWILIO_NUMBER, GROQ_KEY, DEEPGRAM_KEY, CARTESIA_KEY, BASE_URL]):
-    print("CRITICAL WARNING: One or more Environment Variables are missing!")
+    print("WARNING: One or more environment variables are missing!")
 
-# 3. Initialize Clients
-try:
-    client = Client(TWILIO_SID, TWILIO_TOKEN)
-    groq_client = Groq(api_key=GROQ_KEY)
-except Exception as e:
-    print(f"Error initializing clients: {e}")
+# Initialize Clients
+client = Client(TWILIO_SID, TWILIO_TOKEN)
+groq_client = Groq(api_key=GROQ_KEY)
 
-# 4. Mount static directory
+# Static directory for MP3 playback
 STATIC_DIR = "static"
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -43,64 +38,59 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # ---------------- CALL USER ----------------
 @app.get("/call")
 def call_user(phone: str):
-    """Trigger an outbound call to the user."""
     if not BASE_URL:
-        return {"error": "BASE_URL is not set in Environment Variables"}
+        return {"error": "BASE_URL missing"}
 
     try:
-        print(f"Dialing {phone} from {TWILIO_NUMBER}...")
         call = client.calls.create(
             to=phone,
             from_=TWILIO_NUMBER,
-            url=f"{BASE_URL}/voice"  # Uses the variable, not a fixed string
+            url=f"{BASE_URL}/voice"
         )
         return {"status": "calling", "sid": call.sid}
     except Exception as e:
-        print(f"Twilio Error: {e}")
         return {"error": str(e)}
 
 # ---------------- BEGIN CALL ----------------
 @app.post("/voice", response_class=PlainTextResponse)
 async def voice(request: Request):
-    """Initial greeting when user picks up."""
+    """Initial greeting when call starts"""
     resp = VoiceResponse()
-    resp.say("Hello. I am your AI assistant. Please speak after the beep.")
+    resp.say("Hello. I am your AI assistant. You can start speaking now.")
+
+    # NO BEEP, NO PLAY_BEEP
     resp.record(
-        action=f"{BASE_URL}/process", 
-        timeout=2,              
-        play_beep=True
+        action=f"{BASE_URL}/process",
+        timeout=2,
+        play_beep=False  # removed beep
     )
     return str(resp)
 
 # ---------------- PROCESS USER SPEECH ----------------
 @app.post("/process", response_class=PlainTextResponse)
 async def process(request: Request, background_tasks: BackgroundTasks):
-    """Handle the recording, transcribe, think, and speak."""
     form = await request.form()
     audio_url = form.get("RecordingUrl")
     call_sid = form.get("CallSid", "unknown")
-
-    print(f"Processing recording: {audio_url}")
 
     if not audio_url:
         resp = VoiceResponse()
         resp.say("I didn't hear anything. Goodbye.")
         return str(resp)
 
-    # 1️⃣ Download user audio (With Twilio Auth)
+    # 1️⃣ Download user audio
     try:
         wav_resp = requests.get(f"{audio_url}.wav", auth=(TWILIO_SID, TWILIO_TOKEN))
         wav_data = wav_resp.content
-    except Exception as e:
-        print(f"Download Error: {e}")
+    except Exception:
         resp = VoiceResponse()
-        resp.say("Connection error. Goodbye.")
+        resp.say("Audio download error.")
         return str(resp)
 
-    # 2️⃣ STT via Deepgram
+    # 2️⃣ Fast STT — Deepgram nova-2-general
     try:
         dg_resp = requests.post(
-            "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true",
+            "https://api.deepgram.com/v1/listen?model=nova-2-general&smart_format=true",
             headers={
                 "Authorization": f"Token {DEEPGRAM_KEY}",
                 "Content-Type": "audio/wav"
@@ -108,35 +98,33 @@ async def process(request: Request, background_tasks: BackgroundTasks):
             data=wav_data
         ).json()
         transcript = dg_resp.get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0].get("transcript", "")
-        print(f"User said: {transcript}")
-    except Exception as e:
-        print(f"Deepgram Error: {e}")
+        print("User:", transcript)
+    except Exception:
         transcript = ""
 
     if not transcript:
         resp = VoiceResponse()
-        resp.say("I didn't catch that. Please say it again.")
+        resp.say("Sorry, I didn't get that. Try again.")
         resp.redirect(f"{BASE_URL}/voice")
         return str(resp)
 
-    # 3️⃣ LLM Response (Groq)
+    # 3️⃣ Fast LLM — LLaMA 3.1 8B Instant
     try:
         chat_completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=[
-                {"role": "system", "content": "You are a helpful phone assistant. Be extremely concise. Keep answers under 2 sentences."},
+                {"role": "system", "content": "You are a helpful phone AI. Reply in under 2 sentences. Speak naturally."},
                 {"role": "user", "content": transcript}
             ]
         )
         llm_resp = chat_completion.choices[0].message.content
-        print(f"AI reply: {llm_resp}")
-    except Exception as e:
-        print(f"Groq Error: {e}")
-        llm_resp = "I am having trouble thinking right now."
+        print("AI:", llm_resp)
+    except Exception:
+        llm_resp = "I'm having a small issue thinking right now."
 
-    # 4️⃣ TTS via Cartesia
-    voice_id = "0bb159e1-5c0a-48fb-aa29-ed7c0401f116" # Generic Male Voice
-    
+    # 4️⃣ Ultra-Natural TTS — Cartesia Fluency-v2
+    voice_id = "d98128f8-c120-474b-ab3f-b85c1fa6da64"  # Best natural female voice
+
     try:
         tts_resp = requests.post(
             "https://api.cartesia.ai/tts/bytes",
@@ -146,39 +134,51 @@ async def process(request: Request, background_tasks: BackgroundTasks):
                 "Content-Type": "application/json"
             },
             json={
-                "model_id": "sonic-english",
+                "model_id": "fluency-v2",
                 "transcript": llm_resp,
-                "voice": {"mode": "id", "id": voice_id},
-                "output_format": {"container": "mp3", "encoding": "mp3", "sample_rate": 44100}
+                "voice": {
+                    "mode": "id",
+                    "id": voice_id,
+                    "style": {
+                        "emotion": "friendly",
+                        "speed": 1.08,
+                        "pitch": 1.1,
+                        "energy": "high"
+                    }
+                },
+                "output_format": {
+                    "container": "mp3",
+                    "encoding": "mp3",
+                    "sample_rate": 44100,
+                    "loudness": "boost"
+                }
             }
         )
 
         if tts_resp.status_code != 200:
-            print(f"Cartesia Error: {tts_resp.text}")
-            raise Exception("TTS Failed")
+            raise Exception(tts_resp.text)
 
-        # Save file with unique name
         filename = f"response_{call_sid}_{uuid.uuid4().hex[:6]}.mp3"
         file_path = os.path.join(STATIC_DIR, filename)
-        
+
         with open(file_path, "wb") as f:
             f.write(tts_resp.content)
 
-        # 5️⃣ Play Audio
+        # 5️⃣ Play the AI response
         resp = VoiceResponse()
         resp.play(f"{BASE_URL}/static/{filename}")
-        
-        # Loop back to record again
+
+        # Loop again (still no beep)
         resp.record(
             action=f"{BASE_URL}/process",
             timeout=2,
-            play_beep=True
+            play_beep=False
         )
-        
+
         return str(resp)
 
     except Exception as e:
-        print(f"Processing Error: {e}")
+        print("TTS Error:", e)
         resp = VoiceResponse()
-        resp.say("Sorry, I encountered an error.")
+        resp.say("Sorry, I had an issue speaking.")
         return str(resp)
