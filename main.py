@@ -135,7 +135,7 @@ async def process(request: Request, background_tasks: BackgroundTasks):
         llm_resp = "I am having trouble thinking right now."
 
     # 4️⃣ TTS via Cartesia
-    voice_id = "a0e99841-438c-4a64-b679-ae501e7d6091" # Generic Male Voice
+    voice_id = "0bb159e1-5c0a-48fb-aa29-ed7c0401f116" # Generic Male Voice
     
     try:
         tts_resp = requests.post(
