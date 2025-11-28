@@ -2,5 +2,6 @@ fastapi
 uvicorn
 requests
 twilio
-python-dotenv
 groq
+python-dotenv
+python-multipart
