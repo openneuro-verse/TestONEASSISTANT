@@ -1,7 +1,6 @@
 import os
 import requests
 import uuid
-import time
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -10,24 +9,33 @@ from twilio.rest import Client
 from groq import Groq
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
 app = FastAPI()
 
 # ---------------- CONFIG ----------------
+# 1. Get Environment Variables
 TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 DEEPGRAM_KEY = os.getenv("DEEPGRAM_API_KEY")
 CARTESIA_KEY = os.getenv("CARTESIA_API_KEY")
-BASE_URL = os.getenv("BASE_URL")
+BASE_URL = os.getenv("BASE_URL")  # Crucial for Render
 
-# Initialize Clients
-client = Client(TWILIO_SID, TWILIO_TOKEN)
-groq_client = Groq(api_key=GROQ_KEY)
+# 2. Check for missing keys (Helps debug 500 errors)
+if not all([TWILIO_SID, TWILIO_TOKEN, TWILIO_NUMBER, GROQ_KEY, DEEPGRAM_KEY, CARTESIA_KEY, BASE_URL]):
+    print("CRITICAL WARNING: One or more Environment Variables are missing!")
 
-# Mount static directory
+# 3. Initialize Clients
+try:
+    client = Client(TWILIO_SID, TWILIO_TOKEN)
+    groq_client = Groq(api_key=GROQ_KEY)
+except Exception as e:
+    print(f"Error initializing clients: {e}")
+
+# 4. Mount static directory
 STATIC_DIR = "static"
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -35,122 +43,142 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # ---------------- CALL USER ----------------
 @app.get("/call")
 def call_user(phone: str):
+    """Trigger an outbound call to the user."""
     if not BASE_URL:
-        return {"error": "BASE_URL missing"}
-    
-    call = client.calls.create(
-        to=phone,
-        from_=TWILIO_NUMBER,
-        url=f"{BASE_URL}/voice"
-    )
-    return {"status": "calling", "sid": call.sid}
+        return {"error": "BASE_URL is not set in Environment Variables"}
+
+    try:
+        print(f"Dialing {phone} from {TWILIO_NUMBER}...")
+        call = client.calls.create(
+            to=phone,
+            from_=TWILIO_NUMBER,
+            url=f"{BASE_URL}/voice"  # Uses the variable, not a fixed string
+        )
+        return {"status": "calling", "sid": call.sid}
+    except Exception as e:
+        print(f"Twilio Error: {e}")
+        return {"error": str(e)}
 
 # ---------------- BEGIN CALL ----------------
 @app.post("/voice", response_class=PlainTextResponse)
 async def voice(request: Request):
+    """Initial greeting when user picks up."""
     resp = VoiceResponse()
-    
-    # "gather" is faster than "record" for detecting silence
-    # But for open-ended conversation, we stick to record with tighter settings
-    resp.say("Hello. I'm listening.") 
-    
+    resp.say("Hello. I am your AI assistant. Please speak after the beep.")
     resp.record(
-        action=f"{BASE_URL}/process",
-        timeout=1,           # Wait only 1 second of silence to detect end of speech
-        max_length=10,       # Limit recording to 10s to force speed
-        play_beep=False,     # <--- REMOVED THE BEEP
-        trim="trim-silence"  # Remove empty audio at start/end
+        action=f"{BASE_URL}/process", 
+        timeout=2,              
+        play_beep=True
     )
     return str(resp)
 
 # ---------------- PROCESS USER SPEECH ----------------
 @app.post("/process", response_class=PlainTextResponse)
 async def process(request: Request, background_tasks: BackgroundTasks):
-    start_time = time.time()
+    """Handle the recording, transcribe, think, and speak."""
     form = await request.form()
     audio_url = form.get("RecordingUrl")
-    
+    call_sid = form.get("CallSid", "unknown")
+
+    print(f"Processing recording: {audio_url}")
+
     if not audio_url:
         resp = VoiceResponse()
-        resp.say("Are you still there?")
-        resp.redirect(f"{BASE_URL}/voice")
+        resp.say("I didn't hear anything. Goodbye.")
         return str(resp)
 
-    # 1. Download Audio (Fastest method)
-    wav_resp = requests.get(f"{audio_url}.wav", auth=(TWILIO_SID, TWILIO_TOKEN))
-    wav_data = wav_resp.content
+    # 1️⃣ Download user audio (With Twilio Auth)
+    try:
+        wav_resp = requests.get(f"{audio_url}.wav", auth=(TWILIO_SID, TWILIO_TOKEN))
+        wav_data = wav_resp.content
+    except Exception as e:
+        print(f"Download Error: {e}")
+        resp = VoiceResponse()
+        resp.say("Connection error. Goodbye.")
+        return str(resp)
 
-    # 2. STT (Deepgram Nova-2 Phone Model) -> Optimized for telephone audio
-    dg_resp = requests.post(
-        "https://api.deepgram.com/v1/listen?model=nova-2-phone&smart_format=true",
-        headers={"Authorization": f"Token {DEEPGRAM_KEY}", "Content-Type": "audio/wav"},
-        data=wav_data
-    ).json()
-    
-    transcript = dg_resp.get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0].get("transcript", "")
-    print(f"User: {transcript}")
+    # 2️⃣ STT via Deepgram
+    try:
+        dg_resp = requests.post(
+            "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true",
+            headers={
+                "Authorization": f"Token {DEEPGRAM_KEY}",
+                "Content-Type": "audio/wav"
+            },
+            data=wav_data
+        ).json()
+        transcript = dg_resp.get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0].get("transcript", "")
+        print(f"User said: {transcript}")
+    except Exception as e:
+        print(f"Deepgram Error: {e}")
+        transcript = ""
 
     if not transcript:
         resp = VoiceResponse()
-        resp.redirect(f"{BASE_URL}/voice") # Loop immediately if silence
+        resp.say("I didn't catch that. Please say it again.")
+        resp.redirect(f"{BASE_URL}/voice")
         return str(resp)
 
-    # 3. LLM (Groq - Llama 3 for speed)
-    # Using Llama 3 8b is faster than Mixtral
-    chat_completion = groq_client.chat.completions.create(
-        model="llama3-8b-8192", 
-        messages=[
-            {
-                "role": "system", 
-                # PROMPT ENGINEERING FOR REALISM
-                "content": "You are a helpful friend, not a robot. Speak casually. Do not use lists. Keep answers very short (under 10 words)."
+    # 3️⃣ LLM Response (Groq)
+    try:
+        chat_completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a helpful phone assistant. Be extremely concise. Keep answers under 2 sentences."},
+                {"role": "user", "content": transcript}
+            ]
+        )
+        llm_resp = chat_completion.choices[0].message.content
+        print(f"AI reply: {llm_resp}")
+    except Exception as e:
+        print(f"Groq Error: {e}")
+        llm_resp = "I am having trouble thinking right now."
+
+    # 4️⃣ TTS via Cartesia
+    voice_id = "a0e99841-438c-4a64-b679-ae501e7d6091" # Generic Male Voice
+    
+    try:
+        tts_resp = requests.post(
+            "https://api.cartesia.ai/tts/bytes",
+            headers={
+                "X-API-Key": CARTESIA_KEY,
+                "Cartesia-Version": "2024-06-10",
+                "Content-Type": "application/json"
             },
-            {"role": "user", "content": transcript}
-        ],
-        max_tokens=50 # Force short answers for speed
-    )
-    llm_resp = chat_completion.choices[0].message.content
-    print(f"AI: {llm_resp}")
-
-    # 4. TTS (Cartesia - Optimized for Phone)
-    # Voice: 'Salesman' style (more punchy/loud)
-    voice_id = "5c3c89e5-535f-442d-9916-466d34cc62a4" 
-    
-    tts_resp = requests.post(
-        "https://api.cartesia.ai/tts/bytes",
-        headers={
-            "X-API-Key": CARTESIA_KEY,
-            "Cartesia-Version": "2024-06-10",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model_id": "sonic-english",
-            "transcript": llm_resp,
-            "voice": {"mode": "id", "id": voice_id},
-            "output_format": {
-                "container": "wav", 
-                "encoding": "pcm_s16le", 
-                "sample_rate": 8000 # <--- KEY FIX FOR LOUDNESS (Matches Phone Network)
+            json={
+                "model_id": "sonic-english",
+                "transcript": llm_resp,
+                "voice": {"mode": "id", "id": voice_id},
+                "output_format": {"container": "mp3", "encoding": "mp3", "sample_rate": 44100}
             }
-        }
-    )
+        )
 
-    filename = f"resp_{uuid.uuid4().hex[:4]}.wav"
-    file_path = os.path.join(STATIC_DIR, filename)
-    with open(file_path, "wb") as f:
-        f.write(tts_resp.content)
+        if tts_resp.status_code != 200:
+            print(f"Cartesia Error: {tts_resp.text}")
+            raise Exception("TTS Failed")
 
-    print(f"Total processing time: {time.time() - start_time:.2f}s")
+        # Save file with unique name
+        filename = f"response_{call_sid}_{uuid.uuid4().hex[:6]}.mp3"
+        file_path = os.path.join(STATIC_DIR, filename)
+        
+        with open(file_path, "wb") as f:
+            f.write(tts_resp.content)
 
-    # 5. Play Response
-    resp = VoiceResponse()
-    resp.play(f"{BASE_URL}/static/{filename}")
-    
-    # Loop back instantly without beep
-    resp.record(
-        action=f"{BASE_URL}/process",
-        timeout=1,
-        play_beep=False
-    )
-    
-    return str(resp)
+        # 5️⃣ Play Audio
+        resp = VoiceResponse()
+        resp.play(f"{BASE_URL}/static/{filename}")
+        
+        # Loop back to record again
+        resp.record(
+            action=f"{BASE_URL}/process",
+            timeout=2,
+            play_beep=True
+        )
+        
+        return str(resp)
+
+    except Exception as e:
+        print(f"Processing Error: {e}")
+        resp = VoiceResponse()
+        resp.say("Sorry, I encountered an error.")
+        return str(resp)
